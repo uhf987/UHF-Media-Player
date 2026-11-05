@@ -94,7 +94,7 @@ from PyQt5.QtCore import (  # noqa: E402
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt5.QtGui import (  # noqa: E402
-    QPainter, QColor, QPen, QRegion, QPalette, QCursor, QIcon,
+    QPainter, QColor, QPen, QRegion, QPalette, QCursor, QIcon, QPixmap,
 )
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -809,7 +809,15 @@ class CropOverlay(QWidget):
 class TrimBar(QWidget):
     changed = pyqtSignal()
     preview_seek = pyqtSignal(float)  # 0..1 oran - sürüklenen tutamacın anlık konumu
-    MIN_GAP_RATIO = 0.005  # tutamaçların birbirine yapışmasını engeller
+    MIN_GAP_RATIO = 0.005  # (süre bilinmiyorsa yedek değer)  # tutamaçların birbirine yapışmasını engeller
+    MIN_GAP_SECONDS = 0.1  # iki tutamaç arasındaki en küçük aralık (saniye)
+
+    def _min_gap(self):
+        """En küçük aralık artık ORAN değil SANİYE cinsinden: eskiden süre
+        ile orantılıydı (ör. 4 saatlik videoda ~72 sn), şimdi hep 0,1 sn."""
+        if self._duration > 0:
+            return min(0.5, self.MIN_GAP_SECONDS / self._duration)
+        return self.MIN_GAP_RATIO
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -855,7 +863,7 @@ class TrimBar(QWidget):
         if self._duration <= 0:
             return
         delta_ratio = delta_seconds / self._duration
-        self._start = max(0.0, min(self._start + delta_ratio, self._end - self.MIN_GAP_RATIO))
+        self._start = max(0.0, min(self._start + delta_ratio, self._end - self._min_gap()))
         self.update()
         self.changed.emit()
         # Sürüklemede olduğu gibi, +/- ile ayarlarken de videoyu o ana
@@ -866,7 +874,7 @@ class TrimBar(QWidget):
         if self._duration <= 0:
             return
         delta_ratio = delta_seconds / self._duration
-        self._end = min(1.0, max(self._end + delta_ratio, self._start + self.MIN_GAP_RATIO))
+        self._end = min(1.0, max(self._end + delta_ratio, self._start + self._min_gap()))
         self.update()
         self.changed.emit()
         self.preview_seek.emit(self._end)
@@ -912,10 +920,10 @@ class TrimBar(QWidget):
             w = max(1, self.width() - 1)
             ratio = max(0.0, min(1.0, pos.x() / w))
             if abs(ratio - self._start) <= abs(ratio - self._end):
-                self._start = min(ratio, self._end - self.MIN_GAP_RATIO)
+                self._start = min(ratio, self._end - self._min_gap())
                 self._drag_mode = "start"
             else:
-                self._end = max(ratio, self._start + self.MIN_GAP_RATIO)
+                self._end = max(ratio, self._start + self._min_gap())
                 self._drag_mode = "end"
             self.update()
             self.changed.emit()
@@ -938,9 +946,9 @@ class TrimBar(QWidget):
         w = max(1, self.width() - 1)
         ratio = max(0.0, min(1.0, event.pos().x() / w))
         if self._drag_mode == "start":
-            self._start = max(0.0, min(ratio, self._end - self.MIN_GAP_RATIO))
+            self._start = max(0.0, min(ratio, self._end - self._min_gap()))
         elif self._drag_mode == "end":
-            self._end = min(1.0, max(ratio, self._start + self.MIN_GAP_RATIO))
+            self._end = min(1.0, max(ratio, self._start + self._min_gap()))
         elif self._drag_mode == "range":
             dx = (event.pos().x() - self._drag_anchor_x) / w
             s0, e0 = self._drag_anchor_vals
@@ -972,6 +980,182 @@ class TrimBar(QWidget):
         painter.drawRoundedRect(left, 3, 3)
         painter.drawRoundedRect(right, 3, 3)
         painter.end()
+
+
+# --------------------------------------------------------------------------- #
+#  FİLM ŞERİDİ (trim modu): bir tutamacın (başlangıç ya da bitiş) çevresindeki
+#  anların küçük resimlerini yan yana gösterir. Fare tekerleği tutamacı
+#  "adım" kadar ileri/geri oynatır, Ctrl+tekerlek adım boyutunu değiştirir
+#  (1 kare ... 2 dk), bir kareye tıklamak tutamacı o ana taşır.
+# --------------------------------------------------------------------------- #
+def _fmt_precise(seconds):
+    seconds = max(0.0, float(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{int(h):02d}:{int(m):02d}:{s:05.2f}"
+
+
+class FilmStrip(QWidget):
+    CELLS = 7
+    HALF = 3
+    LABEL_H = 16
+
+    wheel_moved = pyqtSignal(int)    # +1 = ileri, -1 = geri
+    zoom_changed = pyqtSignal(int)   # +1 = daha ince adım, -1 = daha kaba
+    time_picked = pyqtSignal(float)  # tıklanan karenin zamanı (saniye)
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._center = 0.0
+        self._step = 1.0
+        self._duration = 0.0
+        self.cache = {}  # ana pencerenin paylaşılan önbelleği: key -> QPixmap
+        self.setFixedHeight(84)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(
+            "Fare tekerleği: tutamacı adım kadar ileri/geri oynat\n"
+            "Ctrl + tekerlek: adım boyutunu değiştir\n"
+            "Bir kareye tıkla: tutamacı oraya taşı"
+        )
+
+    @staticmethod
+    def key(t):
+        return int(round(t * 1000))
+
+    def set_view(self, center, step, duration):
+        self._center, self._step, self._duration = center, step, duration
+        self.update()
+
+    def cell_times(self):
+        return [self._center + (i - self.HALF) * self._step for i in range(self.CELLS)]
+
+    def _valid(self, t):
+        return 0.0 <= t <= self._duration + 1e-6
+
+    def ordered_valid_times(self):
+        """Ortadan dışarıya doğru, sadece videonun içinde kalan zamanlar."""
+        times = self.cell_times()
+        order = sorted(range(self.CELLS), key=lambda i: abs(i - self.HALF))
+        return [times[i] for i in order if self._valid(times[i])]
+
+    def wheelEvent(self, event):
+        dy = event.angleDelta().y()
+        if dy == 0:
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            self.zoom_changed.emit(1 if dy > 0 else -1)
+        else:
+            self.wheel_moved.emit(-1 if dy > 0 else 1)  # tekerlek aşağı = ileri
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or self.width() <= 0:
+            return
+        idx = int(event.pos().x() / (self.width() / self.CELLS))
+        idx = max(0, min(self.CELLS - 1, idx))
+        t = self.cell_times()[idx]
+        if self._valid(t):
+            self.time_picked.emit(t)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(24, 24, 24))
+        cell_w = w / self.CELLS
+        img_h = h - self.LABEL_H
+        times = self.cell_times()
+        for i, t in enumerate(times):
+            x = int(i * cell_w)
+            rect = QRect(x + 1, 1, int(cell_w) - 2, img_h - 2)
+            if self._valid(t):
+                pm = self.cache.get(self.key(t))
+                painter.fillRect(rect, QColor(38, 38, 38))
+                if pm is not None and not pm.isNull():
+                    scaled = pm.scaled(rect.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    painter.drawPixmap(
+                        rect.x() + (rect.width() - scaled.width()) // 2,
+                        rect.y() + (rect.height() - scaled.height()) // 2,
+                        scaled,
+                    )
+                else:
+                    painter.setPen(QColor(110, 110, 110))
+                    painter.drawText(rect, Qt.AlignCenter, "…")
+                painter.setPen(QColor(255, 255, 255) if i == self.HALF else QColor(160, 160, 160))
+                label = _fmt_precise(t) if self._step < 1 else fmt_time_hms(t)
+                painter.drawText(QRect(x, img_h, int(cell_w), self.LABEL_H),
+                                 Qt.AlignCenter, label)
+            else:
+                painter.fillRect(rect, QColor(16, 16, 16))
+
+        # merkez (tutamacın bulunduğu) kareyi vurgula
+        cx = int(self.HALF * cell_w)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 59, 48), 2))
+        painter.drawRect(QRect(cx + 1, 1, int(cell_w) - 2, img_h - 2))
+
+        # başlık (sol üst)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRect(QRect(2, 2, 74, 16))
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(QRect(2, 2, 74, 16), Qt.AlignCenter, self._title)
+        painter.end()
+
+
+class ThumbWorker(QThread):
+    """Verilen anların küçük resimlerini ffmpeg ile tek tek çıkarır. Her küçük
+    resim için '-ss' girdiden ÖNCE verilir (anahtar kareye hızlı atlama), bu
+    yüzden uzun filmlerde de hızlıdır. Yeni istek gelince iptal edilir."""
+    thumb_ready = pyqtSignal(int, float, bytes)  # strip_id, time, jpeg bytes
+
+    def __init__(self, path, jobs, max_t):
+        super().__init__()
+        self.path = path
+        self.jobs = jobs          # [(strip_id, time_seconds), ...]
+        self.max_t = max_t
+        self._cancelled = False
+        self.proc = None
+
+    def cancel(self):
+        self._cancelled = True
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        for strip_id, t in self.jobs:
+            if self._cancelled:
+                return
+            req = max(0.0, min(t, self.max_t))
+            cmd = [
+                FFMPEG, "-v", "error", "-ss", f"{req:.3f}", "-i", self.path,
+                "-frames:v", "1", "-an", "-sn",
+                "-vf", "scale=192:-2,format=yuvj420p",
+                "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "-",
+            ]
+            try:
+                self.proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=NO_WINDOW,
+                )
+                data, _ = self.proc.communicate(timeout=20)
+            except Exception:
+                try:
+                    if self.proc:
+                        self.proc.kill()
+                except Exception:
+                    pass
+                continue
+            if self._cancelled:
+                return
+            if data:
+                self.thumb_ready.emit(strip_id, t, data)
 
 
 # --------------------------------------------------------------------------- #
@@ -1226,6 +1410,15 @@ class VideoStudioPlayer(QMainWindow):
         self._export_field_order = None
         self._music_id_worker = None
 
+        # Trim film şeridi: küçük resim önbelleği + arka plan işçileri
+        self._thumb_cache = {}
+        self._thumb_workers = []
+        self._film_step_idx = 2  # FILM_STEPS içindeki varsayılan: 1 sn
+        self._film_timer = QTimer(self)
+        self._film_timer.setSingleShot(True)
+        self._film_timer.setInterval(150)
+        self._film_timer.timeout.connect(self._refresh_filmstrips)
+
         # Tam ekranda hareketsiz kalan fare imlecini gizleme (bkz.
         # _update_cursor_autohide / _cursor_autohide_tick).
         self._cursor_hidden = False
@@ -1437,11 +1630,30 @@ class VideoStudioPlayer(QMainWindow):
         trim_controls.addWidget(self.btn_trim_end_minus)
         trim_controls.addWidget(self.lbl_trim_end)
         trim_controls.addWidget(self.btn_trim_end_plus)
+        trim_controls.addSpacing(20)
+        self.lbl_film_step = QLabel("Adım: 1 sn")
+        self.lbl_film_step.setToolTip("Film şeridinde Ctrl + fare tekerleği ile değişir")
+        trim_controls.addWidget(self.lbl_film_step)
         trim_controls.addStretch(1)
         self.trim_controls_row = QWidget()
         self.trim_controls_row.setLayout(trim_controls)
         self.trim_controls_row.hide()
         controls_panel_layout.addWidget(self.trim_controls_row)
+
+        # ---- film şeridi: sol başlangıç, sağ bitiş tutamacının çevresi ----
+        self.film_start = FilmStrip("Başlangıç")
+        self.film_end = FilmStrip("Bitiş")
+        self.film_start.cache = self._thumb_cache
+        self.film_end.cache = self._thumb_cache
+        film_layout = QHBoxLayout()
+        film_layout.setContentsMargins(0, 0, 0, 0)
+        film_layout.setSpacing(8)
+        film_layout.addWidget(self.film_start, 1)
+        film_layout.addWidget(self.film_end, 1)
+        self.filmstrip_row = QWidget()
+        self.filmstrip_row.setLayout(film_layout)
+        self.filmstrip_row.hide()
+        controls_panel_layout.addWidget(self.filmstrip_row)
 
         controls_layout = QHBoxLayout()
         self.play_btn = QPushButton("▶")
@@ -1626,6 +1838,13 @@ class VideoStudioPlayer(QMainWindow):
         self.chk_crop.stateChanged.connect(self._on_crop_toggle)
         self.chk_trim.stateChanged.connect(self._on_trim_toggle)
         self.trim_bar.changed.connect(self._update_trim_label)
+        self.trim_bar.changed.connect(self._schedule_film_refresh)
+        self.film_start.wheel_moved.connect(lambda d: self._film_wheel("start", d))
+        self.film_end.wheel_moved.connect(lambda d: self._film_wheel("end", d))
+        self.film_start.zoom_changed.connect(self._film_zoom)
+        self.film_end.zoom_changed.connect(self._film_zoom)
+        self.film_start.time_picked.connect(lambda t: self._film_pick("start", t))
+        self.film_end.time_picked.connect(lambda t: self._film_pick("end", t))
         self.trim_bar.preview_seek.connect(self._on_trim_preview_seek)
         self.btn_trim_start_minus.clicked.connect(lambda: self.trim_bar.nudge_start(-1))
         self.btn_trim_start_plus.clicked.connect(lambda: self.trim_bar.nudge_start(1))
@@ -1684,6 +1903,8 @@ class VideoStudioPlayer(QMainWindow):
         self.native_w = self.native_h = None
         self.status_label.setText("")
         self.lbl_dim.hide()
+        self._cancel_thumb_workers()
+        self._thumb_cache.clear()
         self.chk_trim.setChecked(False)
         self.trim_bar.hide()
         self.trim_bar.reset()
@@ -2299,6 +2520,7 @@ class VideoStudioPlayer(QMainWindow):
         checked = self.chk_trim.isChecked()
         self.trim_bar.setVisible(checked)
         self.trim_controls_row.setVisible(checked)
+        self.filmstrip_row.setVisible(checked)
         if checked:
             try:
                 duration = self.player.duration
@@ -2318,6 +2540,117 @@ class VideoStudioPlayer(QMainWindow):
             else:
                 self.trim_bar.reset()
         self._update_trim_label()
+        if checked:
+            self._schedule_film_refresh()
+        else:
+            self._cancel_thumb_workers()
+
+    # ------------------------------------------------------------------ #
+    #  FİLM ŞERİDİ mantığı
+    # ------------------------------------------------------------------ #
+    # Adım boyutları (saniye); 0 = tam 1 kare (videonun kare hızından).
+    FILM_STEPS = [0, 0.5, 1.0, 5.0, 30.0, 120.0]
+
+    def _film_step_seconds(self):
+        s = self.FILM_STEPS[self._film_step_idx]
+        if s > 0:
+            return s
+        try:
+            fps = float(self.player.container_fps or 0)
+        except Exception:
+            fps = 0.0
+        if fps < 1 or fps > 240:
+            fps = 25.0
+        return 1.0 / fps
+
+    def _film_step_text(self):
+        s = self.FILM_STEPS[self._film_step_idx]
+        return "Adım: 1 kare" if s == 0 else f"Adım: {s:g} sn"
+
+    def _film_wheel(self, which, direction):
+        delta = self._film_step_seconds() * direction
+        if which == "start":
+            self.trim_bar.nudge_start(delta)
+        else:
+            self.trim_bar.nudge_end(delta)
+
+    def _film_pick(self, which, t):
+        if which == "start":
+            self.trim_bar.nudge_start(t - self.trim_bar.start_seconds())
+        else:
+            self.trim_bar.nudge_end(t - self.trim_bar.end_seconds())
+
+    def _film_zoom(self, direction):
+        # direction +1 = daha ince adım (liste başına doğru)
+        self._film_step_idx = max(0, min(len(self.FILM_STEPS) - 1,
+                                         self._film_step_idx - direction))
+        self.lbl_film_step.setText(self._film_step_text())
+        self._refresh_filmstrips()
+
+    def _schedule_film_refresh(self, *_):
+        if self.chk_trim.isChecked():
+            self._film_timer.start()  # tekerlek hızlı dönerken sadece sonuncuya göre çalış
+
+    def _cancel_thumb_workers(self):
+        self._film_timer.stop()
+        for w in list(self._thumb_workers):
+            w.cancel()
+
+    def _refresh_filmstrips(self):
+        if not self.chk_trim.isChecked() or not self.current_path or self.player is None:
+            return
+        try:
+            duration = float(self.player.duration or 0)
+        except Exception:
+            duration = 0.0
+        if duration <= 0:
+            return
+        step = self._film_step_seconds()
+        self.lbl_film_step.setText(self._film_step_text())
+        self.film_start.set_view(self.trim_bar.start_seconds(), step, duration)
+        self.film_end.set_view(self.trim_bar.end_seconds(), step, duration)
+
+        if len(self._thumb_cache) > 600:
+            self._thumb_cache.clear()
+
+        lists = [(0, self.film_start.ordered_valid_times()),
+                 (1, self.film_end.ordered_valid_times())]
+        jobs, seen = [], set()
+        for rank in range(FilmStrip.CELLS):
+            for sid, times in lists:
+                if rank < len(times):
+                    t = times[rank]
+                    k = FilmStrip.key(t)
+                    if k not in self._thumb_cache and k not in seen:
+                        seen.add(k)
+                        jobs.append((sid, t))
+
+        for w in list(self._thumb_workers):
+            w.cancel()
+        if not jobs:
+            return
+        worker = ThumbWorker(self.current_path, jobs, max(0.0, duration - 0.12))
+        worker.thumb_ready.connect(self._on_thumb_ready)
+        worker.finished.connect(lambda w=worker: self._thumb_worker_done(w))
+        self._thumb_workers.append(worker)
+        worker.start()
+
+    def _thumb_worker_done(self, worker):
+        if worker in self._thumb_workers:
+            self._thumb_workers.remove(worker)
+
+    def _on_thumb_ready(self, _strip_id, t, data):
+        pm = QPixmap()
+        if pm.loadFromData(data):
+            self._thumb_cache[FilmStrip.key(t)] = pm
+            self.film_start.update()
+            self.film_end.update()
+
+    def closeEvent(self, event):
+        self._cancel_thumb_workers()
+        for w in list(self._thumb_workers):
+            w.wait(1500)
+        super().closeEvent(event)
 
     def _update_trim_label(self):
         if not self.chk_trim.isChecked():
