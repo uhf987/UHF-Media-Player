@@ -100,7 +100,7 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QFrame, QPushButton, QSlider, QLabel, QComboBox, QSizePolicy, QDialog,
     QDialogButtonBox, QStyle, QStyleOptionSlider, QCheckBox, QRadioButton,
-    QButtonGroup, QFileDialog, QMessageBox, QProgressDialog,
+    QButtonGroup, QFileDialog, QMessageBox, QProgressDialog, QMenu,
 )
 
 
@@ -2125,6 +2125,7 @@ class VideoStudioPlayer(QMainWindow):
         self.asr_btn.setStyleSheet(_live_btn_style)
         self.asr_btn.setToolTip(
             "Sesi altyazıya çevir (Whisper)\n"
+            "Önce konuşulan dili seçersiniz; yalnızca o dil yazılır, diğer kısımlar boş kalır.\n"
             "Film.ai.<dil>.srt olarak videonun yanına kaydedilir.\n"
             "Dosya zaten varsa yeniden üretilmez, sadece yüklenir.\n"
             "Çalışırken tekrar basarsanız İPTAL eder."
@@ -2566,6 +2567,32 @@ class VideoStudioPlayer(QMainWindow):
         self.setFocus()
 
     # ---- 🎙 sesten altyazı ----
+    def _pick_asr_language(self):
+        """Altyazı düğmesine basınca konuşulan dili seçtirir. Seçilen dil dışındaki
+        konuşma parçaları altyazıda boş bırakılır. -> dil kodu | "" (otomatik) | None (iptal)"""
+        cfg = LIVE.load_config()
+        favs = [c for c in cfg.get("favorite_langs", []) if c in LIVE.LANG_NAMES] or ["tr", "en"]
+        menu = QMenu(self)
+        head = menu.addAction("Sadece şu dili yaz (diğer diller boş kalır):")
+        head.setEnabled(False)
+        chosen = {}
+        for c in favs:
+            a = menu.addAction(f"🎙 {LIVE.lang_label(c)}")
+            chosen[a] = c
+        more = menu.addMenu("Diğer diller")
+        for c, name in LIVE.translate_langs():
+            if c not in favs:
+                chosen[more.addAction(name)] = c
+        menu.addSeparator()
+        auto = menu.addAction("Otomatik (her parçanın dilini ayrı algıla)")
+        pos = self.asr_btn.mapToGlobal(self.asr_btn.rect().bottomLeft())
+        act = menu.exec_(pos)
+        if act is None or act is head:
+            return None
+        if act is auto:
+            return ""
+        return chosen.get(act)
+
     def on_asr_clicked(self):
         if LIVE is None:
             QMessageBox.warning(self, "Eksik dosya",
@@ -2582,7 +2609,14 @@ class VideoStudioPlayer(QMainWindow):
             self.asr_btn.setChecked(False)
             return
 
+        asr_lang = self._pick_asr_language()              # "" = otomatik, None = vazgeçildi
+        if asr_lang is None:
+            self.asr_btn.setChecked(False)
+            return
+
         existing = LIVE.find_sources(self.current_path)   # zaten var -> tekrar üretme
+        if asr_lang:
+            existing = [(l, p) for l, p in existing if l == asr_lang]
         if existing:
             lang, path = existing[0]
             self._add_live_subtitle(path, f"Whisper ({lang})", lang)
@@ -2613,7 +2647,7 @@ class VideoStudioPlayer(QMainWindow):
 
         w = LIVE.TranscribeWorker(self.current_path, self._selected_audio_ff_index(),
                                   model_path=model_path, model_label=LIVE.whisper_label(mid),
-                                  ffmpeg=FFMPEG, no_window=NO_WINDOW)
+                                  ffmpeg=FFMPEG, no_window=NO_WINDOW, language=asr_lang or None)
         w.progress.connect(self._asr_progress)
         w.finished_ok.connect(self._asr_done)
         w.failed.connect(self._asr_failed)

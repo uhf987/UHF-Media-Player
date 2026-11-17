@@ -977,6 +977,87 @@ def cuda_available():
         return False
 
 
+# ===================================================== karışık dilli videolar (parça bazlı dil tespiti)
+def plan_chunks(speech, total, max_len=20.0, gap=0.4, pad=0.2):
+    """VAD konuşma aralıkları [(bas, bit), ...] (sn) -> dil tespiti/tanıma için parçalar.
+    Kısa sessizlikte birleştirir, max_len'i aşanları böler, kenarlara pad ekler."""
+    pieces = []
+    for a, b in speech:
+        n = max(1, int((b - a) / max_len + 0.999))
+        w = (b - a) / n
+        pieces += [(a + i * w, a + (i + 1) * w) for i in range(n)]
+    merged = []
+    for a, b in pieces:
+        if merged and a - merged[-1][1] <= gap and b - merged[-1][0] <= max_len:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return [(max(0.0, a - pad), min(total, b + pad), a, b) for a, b in merged if b - a > 0.15]
+
+
+def _norm_probs(all_probs):
+    out = {}
+    for item in all_probs or []:
+        try:
+            k, v = (item if isinstance(item, (tuple, list)) else (item, all_probs[item]))
+        except Exception:
+            continue
+        out[str(k).strip("<|>").lower()] = float(v)
+    return out
+
+
+def choose_languages(chunks, probs, min_share=0.07, min_secs=4.0, max_langs=3):
+    """Parça başına dil seç. chunks: [(bas, bit, ...)], probs: [{dil: olasılık}].
+    1) Videonun gerçekten konuşulan dillerini bul (süre payı) -> 'izinli' kümesi.
+    2) Her parçada yalnızca izinli diller arasından en olasıyı seç (Galce/Latince gibi
+       saçma tahminler elenir). 3) Kısa/emin olunmayan parçalarda önceki parçanın dilini koru.
+    -> ([dil], {dil: süre_sn})"""
+    dur = [c[3] - c[2] for c in chunks]
+    votes = {}
+    for d, pr in zip(dur, probs):
+        if not pr:
+            continue
+        top = max(pr, key=pr.get)
+        if pr[top] >= 0.5:
+            votes[top] = votes.get(top, 0.0) + d
+    total = sum(votes.values())
+    if not total:
+        return ["en"] * len(chunks), {}
+    ranked = sorted(votes, key=votes.get, reverse=True)
+    allowed = [l for l in ranked if votes[l] >= min_secs and votes[l] / total >= min_share][:max_langs]
+    if not allowed:
+        allowed = ranked[:1]
+    langs, prev = [], allowed[0]
+    for d, pr in zip(dur, probs):
+        sub = {l: pr.get(l, 0.0) for l in allowed}
+        s = sum(sub.values())
+        if s <= 0:
+            langs.append(prev)
+            continue
+        best = max(sub, key=sub.get)
+        conf = sub[best] / s
+        if best != prev and ((d < 1.2 and conf < 0.75) or conf < 0.55):
+            best = prev                      # emin değil: dil sürekliliğini koru
+        langs.append(best)
+        prev = best
+    secs = {}
+    for d, l in zip(dur, langs):
+        secs[l] = secs.get(l, 0.0) + d
+    return langs, secs
+
+
+def keep_chunk(pr, lang, dur):
+    """Seçilen dil modunda: bu parça seçilen dilde mi? pr: {dil: olasılık}.
+    Seçilen dil en olasıysa ya da yeterince olasıysa tutulur; yoksa parça boş bırakılır."""
+    if not pr:
+        return False
+    p = pr.get(lang, 0.0)
+    top = max(pr, key=pr.get)
+    if top == lang:
+        return True
+    return p >= (0.40 if dur < 1.0 else 0.30)
+
+
 class TranscribeWorker(QThread):
     """Filmin sesini faster-whisper ile altyazıya çevirir -> film.ai.<dil>.srt
     (model_path: yerel CTranslate2 model klasörü; indirme 📦 penceresinde yapılır)."""
@@ -1068,7 +1149,7 @@ class TranscribeWorker(QThread):
 
             cues = segments_to_cues(filter_segments(segs))
             if not cues:
-                self.failed.emit("Seste konuşma bulunamadı.")
+                self.failed.emit(f"Seçilen dilde ({lang_label(self.language)}) konuşma bulunamadı." if self.language else "Seste konuşma bulunamadı.")
                 return
             out = final_path(self.video, lang)
             part = out + ".part"
@@ -1164,23 +1245,101 @@ class TranscribeWorker(QThread):
     def _transcribe(self, WhisperModel, wav, device, ctype):
         model = WhisperModel(self.model_path, device=device, compute_type=ctype)
         try:
-            seg_iter, info = model.transcribe(
-                wav, language=self.language, vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
-                condition_on_previous_text=False, beam_size=5 if device == "cuda" else 1)
-            lang = info.language
-            total = info.duration or 0.0
-            segs = []
-            for s in seg_iter:
-                if self._stop.is_set():
-                    raise Stopped()
-                segs.append({"start": s.start, "end": s.end, "text": s.text,
-                             "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
-                             "avg_logprob": getattr(s, "avg_logprob", 0.0)})
-                pct = int(min(99, 100 * s.end / total)) if total else -1
-                self.progress.emit(pct, f"Altyazı üretiliyor ({self.model_label}, dil: {lang}, {device})…")
-            return segs, lang
+            if True:                         # parça bazlı dil tespiti (dil seçiliyse sadece o dil)
+                try:
+                    return self._transcribe_mixed(model, wav, device)
+                except Stopped:
+                    raise
+                except (ImportError, AttributeError, TypeError) as e:   # eski faster-whisper API'si
+                    self.progress.emit(-1, f"Karışık dil modu kullanılamadı ({e}); tek dil ile devam…")
+            return self._transcribe_single(model, wav, device)
         finally:
             del model                      # GPU belleği çeviri modeli için boşalsın
             import gc
             gc.collect()
+
+    def _transcribe_mixed(self, model, wav, device):
+        """Konuşmayı VAD ile parçalara böler, HER PARÇANIN dilini ayrı tespit eder ve parçayı
+        o dilde (task=transcribe) tanır: Türkçe kısımlar Türkçe, İngilizce kısımlar orijinal
+        İngilizce kalır; dil etiketi yanlış olduğu için oluşan istemsiz çeviri engellenir."""
+        from faster_whisper import decode_audio
+        from faster_whisper.vad import get_speech_timestamps
+        try:
+            from faster_whisper.vad import VadOptions
+            vopt = VadOptions(min_silence_duration_ms=300, speech_pad_ms=120)
+        except ImportError:
+            vopt = None
+        SR = 16000
+        self.progress.emit(-1, "Ses analiz ediliyor (konuşma bölgeleri)…")
+        audio = decode_audio(wav, sampling_rate=SR)
+        total = len(audio) / float(SR)
+        ts = get_speech_timestamps(audio, vopt) if vopt else get_speech_timestamps(audio)
+        speech = [(t["start"] / SR, t["end"] / SR) for t in ts]
+        chunks = plan_chunks(speech, total)
+        if not chunks:
+            return [], "en"
+
+        # 1) her parçada dil olasılıkları
+        probs = []
+        for i, (a, b, _, _) in enumerate(chunks):
+            if self._stop.is_set():
+                raise Stopped()
+            seg = audio[int(a * SR):int(b * SR)]
+            _l, _p, allp = model.detect_language(seg)
+            probs.append(_norm_probs(allp))
+            self.progress.emit(int(25 * (i + 1) / len(chunks)), "Diller algılanıyor…")
+        only = (self.language or "").lower() or None
+        if only:                             # kullanıcı dil seçti: o dil dışındaki parçalar BOŞ kalır
+            keep = [keep_chunk(pr, only, c[3] - c[2]) for pr, c in zip(probs, chunks)]
+            langs = [only] * len(chunks)
+            secs = {only: sum(c[3] - c[2] for c, k in zip(chunks, keep) if k)}
+            self.skipped = sum(1 for k in keep if not k)
+        else:
+            keep = [True] * len(chunks)
+            langs, secs = choose_languages(chunks, probs)
+
+        # 2) her parçayı kendi dilinde, çevirmeden tanı
+        segs = []
+        for i, ((a, b, _, _), lang) in enumerate(zip(chunks, langs)):
+            if self._stop.is_set():
+                raise Stopped()
+            if not keep[i]:
+                self.progress.emit(25 + int(74 * (i + 1) / len(chunks)),
+                                   f"Altyazı üretiliyor ({self.model_label}, dil: {only}, {device})…")
+                continue
+            seg = audio[int(a * SR):int(b * SR)]
+            it, _info = model.transcribe(
+                seg, language=lang, task="transcribe", vad_filter=False,
+                condition_on_previous_text=False, beam_size=5 if device == "cuda" else 1)
+            for s in it:
+                segs.append({"start": a + s.start, "end": a + s.end, "text": s.text,
+                             "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
+                             "avg_logprob": getattr(s, "avg_logprob", 0.0)})
+            used = "+".join(sorted(secs, key=secs.get, reverse=True)) or lang
+            self.progress.emit(25 + int(74 * (i + 1) / len(chunks)),
+                               f"Altyazı üretiliyor ({self.model_label}, diller: {used}, {device})…")
+        # Dosya etiketi: çeviri adımının kaynak olarak alabilmesi için hedef dil (tr) dışındaki
+        # en baskın dil; yoksa en baskın dil.
+        if only:
+            return segs, only
+        non_dst = [l for l in sorted(secs, key=secs.get, reverse=True) if l != TARGET_LANG]
+        lang = non_dst[0] if non_dst else (max(secs, key=secs.get) if secs else "en")
+        return segs, lang
+
+    def _transcribe_single(self, model, wav, device):
+        seg_iter, info = model.transcribe(
+            wav, language=self.language, task="transcribe", vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            condition_on_previous_text=False, beam_size=5 if device == "cuda" else 1)
+        lang = info.language
+        total = info.duration or 0.0
+        segs = []
+        for s in seg_iter:
+            if self._stop.is_set():
+                raise Stopped()
+            segs.append({"start": s.start, "end": s.end, "text": s.text,
+                         "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
+                         "avg_logprob": getattr(s, "avg_logprob", 0.0)})
+            pct = int(min(99, 100 * s.end / total)) if total else -1
+            self.progress.emit(pct, f"Altyazı üretiliyor ({self.model_label}, dil: {lang}, {device})…")
+        return segs, lang
