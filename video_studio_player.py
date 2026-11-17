@@ -500,46 +500,40 @@ class SubtitleSettingsDialog(QDialog):
 
 
 class TargetLangDialog(QDialog):
-    """🌐 Translate: hedef dil seçimi. Üstte favori diller (varsayılan Türkçe/İngilizce),
-    altta çevirinin desteklendiği tüm diller. Kaynak dil kendiliğinden bilinir (Whisper'ın
-    algıladığı dil); aynı dili hedef seçmek engellenir. Seçilen dil `chosen` içinde kalır."""
+    """🌐 Translate: kaynak ve hedef dil seçimi. Kaynak dil Whisper'ın algıladığı dille
+    gelir; yanlışsa buradan düzeltilir (dosya adı da düzeltilir). Üstte favori diller
+    (varsayılan Türkçe/İngilizce), altta tüm diller. Kaynakla aynı dil hedef olamaz.
+    Sonuç: `chosen` (hedef), `chosen_src` (kaynak)."""
 
     def __init__(self, parent, src_lang, last=None):
         super().__init__(parent)
-        self.setWindowTitle("Çeviri dili")
-        self.setMinimumWidth(380)
+        self.setWindowTitle("Çeviri")
+        self.setMinimumWidth(400)
         self.chosen = None
-        self._src = (src_lang or "").lower()
-        cfg = LIVE.load_config()
-        favs = [c for c in cfg.get("favorite_langs", []) if c in LIVE.LANG_NAMES and c != self._src]
+        self.detected = (src_lang or "").lower()
+        self.chosen_src = self.detected
+        self._last = last
+        self._favs = [c for c in LIVE.load_config().get("favorite_langs", []) if c in LIVE.LANG_NAMES]
+        langs = LIVE.translate_langs()
 
         layout = QVBoxLayout(self)
-        info = QLabel(f"Kaynak dil: <b>{LIVE.lang_label(self._src)}</b> (algılanan)")
-        layout.addWidget(info)
+        layout.addWidget(QLabel("Kaynak dil (algılanan, yanlışsa değiştirin)"))
+        self.src_combo = QComboBox()
+        for c, n in langs:
+            self.src_combo.addItem(n, c)
+        i = self.src_combo.findData(self.detected)
+        if i < 0:                                   # bilinmeyen kod: listeye ekle
+            self.src_combo.addItem(LIVE.lang_label(self.detected), self.detected)
+            i = self.src_combo.count() - 1
+        self.src_combo.setCurrentIndex(i)
+        layout.addWidget(self.src_combo)
 
         layout.addWidget(QLabel("Favori diller"))
-        row = QHBoxLayout()
-        for code in favs:
-            b = QPushButton(LIVE.lang_label(code))
-            b.setMinimumHeight(34)
-            b.setFocusPolicy(Qt.NoFocus)
-            b.clicked.connect(lambda _=False, c=code: self._pick(c))
-            row.addWidget(b)
-        if not favs:
-            row.addWidget(QLabel("—"))
-        layout.addLayout(row)
+        self.fav_row = QHBoxLayout()
+        layout.addLayout(self.fav_row)
 
         layout.addWidget(QLabel("Tüm diller"))
         self.combo = QComboBox()
-        self.combo.setEditable(False)
-        langs = [(c, n) for c, n in LIVE.translate_langs() if c != self._src]
-        for c, n in langs:
-            self.combo.addItem(n, c)
-        want = last if last and last != self._src else None
-        if want:
-            i = self.combo.findData(want)
-            if i >= 0:
-                self.combo.setCurrentIndex(i)
         layout.addWidget(self.combo)
 
         hint = QLabel("Çeviri TranslateGemma ile yapılır; dosya videonun yanına\n"
@@ -555,8 +549,36 @@ class TargetLangDialog(QDialog):
         box.rejected.connect(self.reject)
         layout.addWidget(box)
 
+        self.src_combo.currentIndexChanged.connect(self._rebuild)
+        self._rebuild()
+
+    def _rebuild(self):
+        """Kaynak değişince favori düğmeleri ve hedef listesi yeniden kurulur."""
+        self.chosen_src = self.src_combo.currentData() or self.detected
+        while self.fav_row.count():
+            it = self.fav_row.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        favs = [c for c in self._favs if c != self.chosen_src]
+        for code in favs:
+            b = QPushButton(LIVE.lang_label(code))
+            b.setMinimumHeight(34)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, c=code: self._pick(c))
+            self.fav_row.addWidget(b)
+        if not favs:
+            self.fav_row.addWidget(QLabel("—"))
+        cur = self.combo.currentData() or self._last
+        self.combo.clear()
+        for c, n in LIVE.translate_langs():
+            if c != self.chosen_src:
+                self.combo.addItem(n, c)
+        i = self.combo.findData(cur)
+        if i >= 0:
+            self.combo.setCurrentIndex(i)
+
     def _pick(self, code):
-        if not code:
+        if not code or code == self.chosen_src:
             return
         self.chosen = code
         self.accept()
@@ -2660,6 +2682,24 @@ class VideoStudioPlayer(QMainWindow):
             self.tr_btn.setChecked(False)
             return
         dst = dlg.chosen
+        if dlg.chosen_src and dlg.chosen_src != src_lang:
+            # Kullanıcı kaynak dili düzeltti: kaynak dosyanın adını da düzelt (film.ai.<yeni>.srt)
+            fixed = LIVE.final_path(self.current_path, dlg.chosen_src)
+            if os.path.exists(fixed):
+                QMessageBox.warning(self, "Dosya zaten var",
+                                    f"{os.path.basename(fixed)} zaten var; kaynak dili bu şekilde "
+                                    "değiştiremem. Dosyalardan birini yeniden adlandırın.")
+                self.tr_btn.setChecked(False)
+                return
+            try:
+                os.replace(_src_path, fixed)
+            except OSError as e:
+                QMessageBox.warning(self, "Dosya adı değişmedi", str(e))
+                self.tr_btn.setChecked(False)
+                return
+            src_lang, _src_path = dlg.chosen_src, fixed
+            self.status_label.setText(f"Kaynak dil {LIVE.lang_label(src_lang)} olarak düzeltildi: "
+                                      f"{os.path.basename(fixed)}")
         cfg["last_target"] = dst
         try:
             LIVE.save_config(cfg)
