@@ -94,7 +94,7 @@ from PyQt5.QtCore import (  # noqa: E402
 )
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PyQt5.QtGui import (  # noqa: E402
-    QPainter, QColor, QPen, QRegion, QPalette, QCursor, QIcon, QPixmap,
+    QPainter, QColor, QPen, QRegion, QPalette, QCursor, QIcon, QPixmap, QFont,
 )
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -1812,6 +1812,7 @@ class VideoStudioPlayer(QMainWindow):
         self.fs_controls = FullscreenControls(self, self.SEEK_RANGE)
         self._connect_signals()
         self._disable_child_focus()
+        self._fit_buttons()
 
         self.player = None
         self.timer = None
@@ -2275,6 +2276,16 @@ class VideoStudioPlayer(QMainWindow):
 
         self.video_frame.resized.connect(self._update_video_rect)
         self.crop_overlay.changed.connect(self._update_dim_label)
+
+    def _fit_buttons(self):
+        """Sabit piksel genişlikli düğmeler, yazı tipi büyüdüğünde (Windows metin/DPI ölçeği)
+        içeriği kesmesin: genişlik en az eskisi kadar, gerekirse içeriğe göre büyür."""
+        for b in (self.btn_open, self.play_btn, self.screenshot_btn, self.music_id_btn,
+                  self.btn_mono_l, self.btn_mono_r, self.subtitle_settings_btn,
+                  self.asr_btn, self.tr_btn, self.model_btn, self.btn_export):
+            base = b.minimumWidth()
+            b.setMaximumWidth(16777215)
+            b.setMinimumWidth(max(base, b.sizeHint().width()))
 
     def _disable_child_focus(self):
         """Ok tuşlarının HER ZAMAN pencereye (ileri/geri sarma) gitmesi için
@@ -3978,6 +3989,13 @@ def apply_dark_theme(app: QApplication):
     bu native/özel çizilen widget'lara hiç dokunmadan geri kalan tüm arayüzü
     (butonlar, kutucuklar, etiketler, iletişim pencereleri) koyulaştırır."""
     app.setStyle("Fusion")
+    # Yazı tipini sistemden almak yerine SABİTLE: Windows'taki "Ayarlar > Erişilebilirlik >
+    # Metin boyutu" kaydırıcısı Qt'ye büyük font olarak yansıyıp düğmeleri/yazıları bozuyordu.
+    _f = QFont(app.font())
+    if sys.platform == "win32":
+        _f.setFamily("Segoe UI")
+    _f.setPointSizeF(9.0)
+    app.setFont(_f)
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(43, 43, 43))
     palette.setColor(QPalette.WindowText, QColor(255, 255, 255))
@@ -4010,6 +4028,19 @@ def main():
             )
         except Exception:
             pass
+
+    # Windows ekran ölçeklendirmesi (%125/%150...) ile yazıların/ikonların büyüyüp düğmelerin
+    # sabit piksel genişliğinde kesilmesini önler: Qt5'te varsayılan olarak yazı tipleri sistem
+    # DPI'sına göre büyür ama setFixedWidth(...) gibi piksel değerleri büyümez. Yüksek-DPI
+    # ölçekleme açılınca HER ŞEY aynı oranda ölçeklenir. QApplication'dan ÖNCE çağrılmalı.
+    try:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+        if hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):     # Qt >= 5.14
+            QApplication.setHighDpiScaleFactorRoundingPolicy(
+                Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)             # 125%/150% olduğu gibi
+    except Exception:
+        pass
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("icon.ico")))
