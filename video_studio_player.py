@@ -148,6 +148,18 @@ MUSIC_ID_SAMPLE_RATE = 44100
 MUSIC_ID_READ_SECONDS = 10
 MUSIC_ID_SILENCE_THRESH = 0.01
 
+# Sesten altyazı (Whisper) + canlı Türkçe çeviri (Ollama/TranslateGemma) ve
+# 📦 Model Ayarları penceresi: live_subtitle.py. Dosya yoksa/yüklenemezse özellik
+# sessizce devre dışı kalır, oynatıcı çalışır.
+import shutil  # noqa: E402
+from PyQt5.QtWidgets import (QTableWidget, QTableWidgetItem, QHeaderView,  # noqa: E402
+                             QAbstractItemView, QRadioButton, QApplication)
+try:
+    import live_subtitle as LIVE  # noqa: E402
+except Exception as _live_err:  # pragma: no cover
+    LIVE = None
+    print("live_subtitle yüklenemedi:", _live_err)
+
 # Windows dosya ilişkilendirmesiyle (bir video dosyasına çift tıklama) her
 # seferinde YENİ bir işlem başlar. Tek pencere kalması için bu isimde bir
 # yerel sunucu (Windows'ta named pipe, Linux/Mac'te unix socket) kuruyoruz;
@@ -485,6 +497,347 @@ class SubtitleSettingsDialog(QDialog):
 
     def values(self):
         return self.scale_slider.value(), self.pos_slider.value()
+
+
+class TargetLangDialog(QDialog):
+    """🌐 Translate: hedef dil seçimi. Üstte favori diller (varsayılan Türkçe/İngilizce),
+    altta çevirinin desteklendiği tüm diller. Kaynak dil kendiliğinden bilinir (Whisper'ın
+    algıladığı dil); aynı dili hedef seçmek engellenir. Seçilen dil `chosen` içinde kalır."""
+
+    def __init__(self, parent, src_lang, last=None):
+        super().__init__(parent)
+        self.setWindowTitle("Çeviri dili")
+        self.setMinimumWidth(380)
+        self.chosen = None
+        self._src = (src_lang or "").lower()
+        cfg = LIVE.load_config()
+        favs = [c for c in cfg.get("favorite_langs", []) if c in LIVE.LANG_NAMES and c != self._src]
+
+        layout = QVBoxLayout(self)
+        info = QLabel(f"Kaynak dil: <b>{LIVE.lang_label(self._src)}</b> (algılanan)")
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("Favori diller"))
+        row = QHBoxLayout()
+        for code in favs:
+            b = QPushButton(LIVE.lang_label(code))
+            b.setMinimumHeight(34)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, c=code: self._pick(c))
+            row.addWidget(b)
+        if not favs:
+            row.addWidget(QLabel("—"))
+        layout.addLayout(row)
+
+        layout.addWidget(QLabel("Tüm diller"))
+        self.combo = QComboBox()
+        self.combo.setEditable(False)
+        langs = [(c, n) for c, n in LIVE.translate_langs() if c != self._src]
+        for c, n in langs:
+            self.combo.addItem(n, c)
+        want = last if last and last != self._src else None
+        if want:
+            i = self.combo.findData(want)
+            if i >= 0:
+                self.combo.setCurrentIndex(i)
+        layout.addWidget(self.combo)
+
+        hint = QLabel("Çeviri TranslateGemma ile yapılır; dosya videonun yanına\n"
+                      "film.ai.<dil>.srt olarak kaydedilir.")
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        box = QDialogButtonBox()
+        ok = box.addButton("Çevir", QDialogButtonBox.AcceptRole)
+        box.addButton("İptal", QDialogButtonBox.RejectRole)
+        ok.setDefault(True)
+        ok.clicked.connect(lambda: self._pick(self.combo.currentData()))
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def _pick(self, code):
+        if not code:
+            return
+        self.chosen = code
+        self.accept()
+
+
+class ModelSettingsDialog(QDialog):
+    """📦 Model Ayarları: Whisper (sesi yazıya çevirme) modellerini listeler - buradan
+    indirilir/silinir/seçilir - ve TranslateGemma (çeviri) boyutunu (4B/12B/27B) seçtirir.
+    TranslateGemma'yı bu pencere İNDİRMEZ; yüklü değilse Ollama komutunu gösterir.
+    Seçimler anında kaydedilir. İndirme sürerken pencere kapanırsa indirme durur
+    (yarım dosya silinmez, sonra kaldığı yerden devam eder)."""
+
+    _keep = []      # kapanırken hâlâ biten indirme işçilerini GC'den korur
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Model Ayarları")
+        self.setMinimumWidth(640)
+        self._cfg = LIVE.load_config()
+        self._dl = None
+        self._dl_status = None
+        self._rec = "large-v3" if LIVE.cuda_available() else "small"
+
+        layout = QVBoxLayout(self)
+
+        head = QHBoxLayout()
+        head.addWidget(QLabel("Sesi yazıya çevirme (Whisper)"))
+        head.addStretch(1)
+        self.btn_add_dir = QPushButton("＋ Klasörden model ekle…")
+        self.btn_add_dir.setToolTip("İçinde model.bin olan bir faster-whisper klasörü "
+                                    "(ör. Subtitle Edit'teki faster-whisper-large-v3).")
+        self.btn_add_dir.setFocusPolicy(Qt.NoFocus)
+        self.btn_add_dir.clicked.connect(self._add_dir)
+        head.addWidget(self.btn_add_dir)
+        layout.addLayout(head)
+        self.w_table = self._new_table()
+        layout.addWidget(self.w_table)
+        self.w_hint = QLabel(
+            "★ önerilen: ekran kartı varsa large-v3 (ya da daha hızlı large-v3-turbo), yoksa small / medium.\n"
+            "İndirme sürerken pencereyi kapatırsanız durur, sonra kaldığı yerden devam eder.")
+        self._style_hint(self.w_hint, 2)
+        layout.addWidget(self.w_hint)
+
+        head2 = QHBoxLayout()
+        head2.addWidget(QLabel("Çeviri (TranslateGemma · Ollama)"))
+        head2.addStretch(1)
+        self.btn_refresh = QPushButton("↻ Yenile")
+        self.btn_refresh.setToolTip("Ollama'daki yüklü modelleri yeniden kontrol et")
+        self.btn_refresh.setFocusPolicy(Qt.NoFocus)
+        self.btn_refresh.clicked.connect(self._rebuild)
+        head2.addWidget(self.btn_refresh)
+        layout.addLayout(head2)
+        self.t_table = self._new_table()
+        layout.addWidget(self.t_table)
+        self.t_hint = QLabel("")
+        self._style_hint(self.t_hint, 2)
+        layout.addWidget(self.t_hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("Kapat")
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._rebuild()
+
+    # ---------------------------------------------------------- yardımcılar
+    def _style_hint(self, lbl, lines):
+        """Satır kaydıran etiketler kutu düzeninde sıkışıp tabloların üstüne binmesin diye
+        yüksekliği baştan ayrılır."""
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color:#999;")
+        lbl.setMinimumHeight(self.fontMetrics().lineSpacing() * lines + 6)
+
+    def _new_table(self):
+        t = QTableWidget(0, 5)
+        t.setHorizontalHeaderLabels(["Kullan", "Model", "Boyut", "Durum", ""])
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setSelectionMode(QAbstractItemView.NoSelection)
+        t.setFocusPolicy(Qt.NoFocus)
+        t.setShowGrid(False)
+        h = t.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        return t
+
+    def _radio_cell(self, table, row, group, enabled, checked, on_select):
+        radio = QRadioButton()
+        radio.setFocusPolicy(Qt.NoFocus)
+        group.addButton(radio)
+        radio.setEnabled(enabled)
+        radio.setChecked(checked)
+        radio.toggled.connect(lambda on: on and on_select())
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(10, 0, 0, 0)
+        lay.addWidget(radio)
+        table.setCellWidget(row, 0, box)
+        return radio
+
+    def _button_cell(self, table, row, text, slot, tip=""):
+        b = QPushButton(text)
+        b.setFocusPolicy(Qt.NoFocus)
+        if tip:
+            b.setToolTip(tip)
+        b.clicked.connect(slot)
+        table.setCellWidget(row, 4, b)
+        return b
+
+    def _status_cell(self, table, row, text):
+        lbl = QLabel(text)
+        lbl.setContentsMargins(6, 0, 6, 0)
+        table.setCellWidget(row, 3, lbl)
+        return lbl
+
+    def _fit_height(self, table):
+        rows = table.rowCount()
+        table.setFixedHeight(table.horizontalHeader().height() + rows * 27 + 4)
+        for r in range(rows):
+            table.setRowHeight(r, 27)
+
+    def _save(self):
+        LIVE.save_config(self._cfg)
+
+    # -------------------------------------------------------------- liste
+    def _rebuild(self):
+        if self._dl is not None:          # indirme sürerken liste yeniden kurulmaz
+            return
+        self._build_whisper()
+        self._build_translate()
+
+    def _build_whisper(self):
+        t = self.w_table
+        entries = LIVE.whisper_entries(self._cfg)
+        sel = LIVE.selected_whisper_id(self._cfg)
+        t.setRowCount(len(entries))
+        self._w_group = QButtonGroup(self)
+        self._w_buttons = []
+        for r, e in enumerate(entries):
+            mid = e["id"]
+            self._radio_cell(t, r, self._w_group, e["downloaded"], e["downloaded"] and mid == sel,
+                             lambda mid=mid: self._select_whisper(mid))
+            name = e["label"] + ("  ★" if mid == self._rec else "")
+            item = QTableWidgetItem(name)
+            item.setToolTip(e["note"])
+            t.setItem(r, 1, item)
+            mb = e["mb"]
+            size = "—" if mb is None else (f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb} MB")
+            t.setItem(r, 2, QTableWidgetItem(size))
+            lbl = self._status_cell(t, r, "İndirildi ✓" if e["downloaded"] else "İndirilmedi")
+            if e["kind"] == "catalog":
+                if e["downloaded"]:
+                    b = self._button_cell(t, r, "Sil", lambda _=False, mid=mid: self._delete(mid))
+                else:
+                    b = self._button_cell(t, r, "İndir",
+                                          lambda _=False, mid=mid, lbl=lbl, r=r: self._download(mid, lbl, r))
+                self._w_buttons.append(b)
+            elif e["kind"] == "custom":
+                self._button_cell(t, r, "Kaldır", lambda _=False, p=e["path"]: self._remove_dir(p),
+                                  "Listeden kaldırır, klasöre dokunmaz")
+        self._fit_height(t)
+
+    def _build_translate(self):
+        t = self.t_table
+        state, installed = LIVE.ollama_models()
+        sel = LIVE.selected_translate_model(self._cfg)
+        t.setRowCount(len(LIVE.TRANSLATE_MODELS))
+        self._t_group = QButtonGroup(self)
+        for r, (name, size_label, gb, note) in enumerate(LIVE.TRANSLATE_MODELS):
+            ok = state == "ok" and LIVE.model_installed(name, installed)
+            self._radio_cell(t, r, self._t_group, ok, name == sel,
+                             lambda name=name: self._select_translate(name))
+            item = QTableWidgetItem(f"TranslateGemma {size_label}")
+            item.setToolTip(note)
+            t.setItem(r, 1, item)
+            t.setItem(r, 2, QTableWidgetItem(f"~{gb:g} GB"))
+            self._status_cell(t, r, "Yüklü ✓" if ok else ("Ollama kapalı" if state == "down" else "Yüklü değil"))
+            if state == "ok" and not ok:
+                self._button_cell(t, r, "Komutu kopyala",
+                                  lambda _=False, n=name: self._copy_cmd(n),
+                                  f"ollama pull {name}")
+        self._fit_height(t)
+        if state == "down":
+            self.t_hint.setText("Ollama çalışmıyor. Ollama'yı açıp ↻ Yenile'ye basın.")
+        else:
+            self.t_hint.setText("Yüklü olmayan boyut için örneğin 'ollama pull translategemma:12b' "
+                                "çalıştırın, sonra ↻ Yenile'ye basın.\n"
+                                "12B / 27B daha doğrudur ama daha çok ekran kartı belleği ister.")
+
+    # ------------------------------------------------------------ eylemler
+    def _select_whisper(self, mid):
+        self._cfg["whisper_model"] = mid
+        self._save()
+
+    def _select_translate(self, name):
+        self._cfg["translate_model"] = name
+        self._save()
+
+    def _copy_cmd(self, name):
+        QApplication.clipboard().setText(f"ollama pull {name}")
+        self.t_hint.setText(f"Kopyalandı: ollama pull {name}   - komut satırına yapıştırıp çalıştırın, "
+                            "bitince ↻ düğmesine basın.")
+
+    def _download(self, mid, status_lbl, row):
+        if self._dl is not None:
+            return
+        w = LIVE.WhisperDownloadWorker(mid)
+        self._dl, self._dl_status = w, status_lbl
+        w.progress.connect(lambda pct, txt: status_lbl.setText(f"%{pct}   {txt}"))
+        w.finished_ok.connect(lambda m: self._dl_end(select=m))
+        w.failed.connect(lambda msg: self._dl_end(error=msg))
+        w.cancelled.connect(lambda: self._dl_end())
+        for b in self._w_buttons:
+            b.setEnabled(False)
+        cancel = self.w_table.cellWidget(row, 4)          # indiren satırın düğmesi: İptal
+        cancel.setText("İptal")
+        cancel.setEnabled(True)
+        cancel.clicked.disconnect()
+        cancel.clicked.connect(w.cancel)
+        status_lbl.setText("başlıyor…")
+        w.start()
+
+    def _dl_end(self, select=None, error=None):
+        w = self._dl
+        self._dl = None
+        if w is not None:
+            w.wait(2000)
+        if select and not self._cfg.get("whisper_model"):
+            self._cfg["whisper_model"] = select           # ilk indirilen model otomatik seçilsin
+            self._save()
+        self._rebuild()
+        if error:
+            QMessageBox.warning(self, "Model indirilemedi", error)
+
+    def _delete(self, mid):
+        ans = QMessageBox.question(self, "Modeli sil",
+                                   f"'{mid}' modeli diskten silinsin mi?\n(İstediğiniz zaman yeniden indirebilirsiniz.)",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        shutil.rmtree(LIVE.whisper_model_dir(mid), ignore_errors=True)
+        if self._cfg.get("whisper_model") == mid:
+            self._cfg["whisper_model"] = None
+            self._save()
+        self._rebuild()
+
+    def _add_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Model klasörünü seçin (içinde model.bin olmalı)")
+        if not d:
+            return
+        if not LIVE.is_ct2_dir(d):
+            QMessageBox.warning(self, "Uygun model değil",
+                                "Bu klasörde faster-whisper (CTranslate2) modeli yok: model.bin ve "
+                                "config.json bulunmalı.\n\nSubtitle Edit'teki whisper.cpp (.bin dosyası) "
+                                "modelleri uyumlu DEĞİLDİR; 'faster-whisper-large-v3' gibi adlı bir "
+                                "klasör seçin.")
+            return
+        dirs = self._cfg.setdefault("custom_whisper_dirs", [])
+        if d not in dirs:
+            dirs.append(d)
+        self._cfg["whisper_model"] = "dir:" + d
+        self._save()
+        self._rebuild()
+
+    def _remove_dir(self, path):
+        self._cfg["custom_whisper_dirs"] = [p for p in self._cfg.get("custom_whisper_dirs", []) if p != path]
+        if self._cfg.get("whisper_model") == "dir:" + path:
+            self._cfg["whisper_model"] = None
+        self._save()
+        self._rebuild()
+
+    def done(self, result):
+        if self._dl is not None:
+            w, self._dl = self._dl, None
+            w.cancel()
+            if not w.wait(3000):
+                ModelSettingsDialog._keep.append(w)
+        super().done(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -1409,6 +1762,11 @@ class VideoStudioPlayer(QMainWindow):
         self._export_preserve_interlace = False
         self._export_field_order = None
         self._music_id_worker = None
+        self._asr_worker = None      # 🎙 sesten altyazı işçisi
+        self._tr_worker = None       # 🌐 canlı çeviri işçisi
+        self._live_zombies = []      # bitmesi beklenen eski işçiler (GC'den korumak için)
+        self._live_sub_loaded = False
+        self._tr_model_label = ""
 
         # Trim film şeridi: küçük resim önbelleği + arka plan işçileri
         self._thumb_cache = {}
@@ -1730,6 +2088,43 @@ class VideoStudioPlayer(QMainWindow):
         self.subtitle_settings_btn.setFixedWidth(40)
         self.subtitle_settings_btn.setToolTip("Altyazı Ayarları")
         tracks_layout.addWidget(self.subtitle_settings_btn)
+
+        # Sesten altyazı (Whisper) ve canlı Türkçe çeviri (TranslateGemma): yan yana iki
+        # AYRI düğme. Etkinken mavi olur ve ilerlemeyi gösterir; tekrar basmak iptal eder.
+        # 📦 = model ayarları penceresi.
+        _live_btn_style = (
+            "QPushButton{background:transparent;border:1px solid #555;border-radius:4px;padding:3px 6px;}"
+            "QPushButton:hover{background:#4a4a4a;}"
+            "QPushButton:checked{background:#3a6ea5;border-color:#3a6ea5;}"
+        )
+        self.asr_btn = QPushButton(self.LIVE_IDLE_ASR)
+        self.asr_btn.setCheckable(True)
+        self.asr_btn.setFixedWidth(104)
+        self.asr_btn.setStyleSheet(_live_btn_style)
+        self.asr_btn.setToolTip(
+            "Sesi altyazıya çevir (Whisper)\n"
+            "Film.ai.<dil>.srt olarak videonun yanına kaydedilir.\n"
+            "Dosya zaten varsa yeniden üretilmez, sadece yüklenir.\n"
+            "Çalışırken tekrar basarsanız İPTAL eder."
+        )
+        tracks_layout.addWidget(self.asr_btn)
+        self.tr_btn = QPushButton(self.LIVE_IDLE_TR)
+        self.tr_btn.setCheckable(True)
+        self.tr_btn.setFixedWidth(104)
+        self.tr_btn.setStyleSheet(_live_btn_style)
+        self.tr_btn.setToolTip(
+            "Altyazıyı seçtiğiniz dile çevir (Ollama + TranslateGemma)\n"
+            "Kaynak dil kendiliğinden bulunur; favori dillerden (Türkçe/İngilizce) ya da tüm diller listesinden seçersiniz.\n"
+            "Model boyutu (4B/12B/27B) 📦 penceresinden seçilir. Ollama açık olmalı.\n"
+            "Tüm altyazı çevrilir, bitince film.ai.<dil>.srt olarak kaydedilip yüklenir.\n"
+            "Çalışırken tekrar basarsanız İPTAL eder."
+        )
+        tracks_layout.addWidget(self.tr_btn)
+        self.model_btn = QPushButton("📦")
+        self.model_btn.setFixedWidth(40)
+        self.model_btn.setStyleSheet(_live_btn_style)
+        self.model_btn.setToolTip("Model ayarları: Whisper modellerini indir/seç, TranslateGemma boyutunu (4B/12B/27B) seç")
+        tracks_layout.addWidget(self.model_btn)
         controls_panel_layout.addLayout(tracks_layout)
 
         main_layout.addWidget(self.controls_panel)
@@ -1830,6 +2225,9 @@ class VideoStudioPlayer(QMainWindow):
         self.audio_combo.currentIndexChanged.connect(self._on_audio_changed)
         self.subtitle_combo.currentIndexChanged.connect(self._on_subtitle_changed)
         self.subtitle_settings_btn.clicked.connect(self.open_subtitle_settings)
+        self.asr_btn.clicked.connect(self.on_asr_clicked)
+        self.tr_btn.clicked.connect(self.on_translate_clicked)
+        self.model_btn.clicked.connect(self.open_model_settings)
 
         self.chk_rotate.stateChanged.connect(self._on_rotate_settings_changed)
         self.radio_cw.toggled.connect(self._on_rotate_settings_changed)
@@ -1864,7 +2262,8 @@ class VideoStudioPlayer(QMainWindow):
             self.play_btn, self.screenshot_btn, self.music_id_btn, self.chk_auto_rename,
             self.btn_mono_l, self.btn_mono_r, self.volume_slider,
             self.seek_slider, self.audio_combo, self.subtitle_combo,
-            self.subtitle_settings_btn, self.chk_rotate, self.radio_cw,
+            self.subtitle_settings_btn, self.asr_btn, self.tr_btn, self.model_btn,
+            self.chk_rotate, self.radio_cw,
             self.radio_ccw, self.radio_180, self.chk_crop, self.chk_trim,
             self.trim_bar, self.btn_trim_start_minus, self.btn_trim_start_plus,
             self.btn_trim_end_minus, self.btn_trim_end_plus, self.btn_export,
@@ -1898,6 +2297,7 @@ class VideoStudioPlayer(QMainWindow):
             # kaydedip mpv hazır olur olmaz otomatik açacağız.
             self._pending_open_path = path
             return
+        self._cancel_live_workers()   # önceki filmin altyazı/çeviri işleri bitsin
         self.current_path = path
         self.idle_logo.hide()
         self.native_w = self.native_h = None
@@ -1938,6 +2338,7 @@ class VideoStudioPlayer(QMainWindow):
 
         self.play_btn.setText("⏸")
         self.setWindowTitle(f"UHF - {os.path.basename(path)}")
+        self._refresh_live_buttons()
 
         self._apply_subtitle_live(self.sub_scale, self.sub_pos)
         self._apply_rotation_to_player()
@@ -2056,6 +2457,305 @@ class VideoStudioPlayer(QMainWindow):
         self.status_label.setText("Tanıma başarısız oldu. Dosyaya dokunulmadı.")
         print("Şarkı tanıma hatası:", message)
         self._music_id_cleanup()
+
+    # ------------------------------------------- sesten altyazı / canlı çeviri
+    # Yan yana düğmeler:  🎙 Altyazı = sesi Whisper ile altyazıya çevirir
+    # (film.ai.<dil>.srt);  🌐 Translate = o altyazıyı Ollama + TranslateGemma ile seçilen dile
+    # çevirir (film.ai.<dil>.srt);  📦 = model ayarları (Whisper indir/seç,
+    # TranslateGemma 4B/12B/27B seç). Etkinken tekrar basmak İPTAL eder.
+    # Mantık live_subtitle.py içinde; burada sadece düğme/bağlantı işleri var.
+    LIVE_IDLE_ASR = "🎙 Altyazı"
+    LIVE_IDLE_TR = "🌐 Translate"
+    LIVE_SUB_TITLE = "Canlı Türkçe"
+
+    def _retire_worker(self, worker):
+        """Çalışmaya devam eden bir QThread'in nesnesi çöp toplayıcıya gidip
+        'Destroyed while thread is still running' çökmesine yol açmasın."""
+        if worker is None:
+            return
+        self._live_zombies.append(worker)
+
+        def _drop():
+            try:
+                self._live_zombies.remove(worker)
+            except ValueError:
+                pass
+        worker.finished.connect(_drop)
+
+    def _refresh_live_buttons(self):
+        asr_on = self._asr_worker is not None
+        tr_on = self._tr_worker is not None
+        has_src = has_tr = False
+        if self.current_path and LIVE is not None:
+            has_src = bool(LIVE.find_sources(self.current_path))
+            has_tr = len(LIVE.find_sources(self.current_path)) >= 2     # kaynak + en az bir çeviri
+        if not asr_on:
+            self.asr_btn.setChecked(False)
+            self.asr_btn.setText(self.LIVE_IDLE_ASR + (" ✓" if has_src else ""))
+        if not tr_on:
+            self.tr_btn.setChecked(False)
+            self.tr_btn.setText(self.LIVE_IDLE_TR + (" ✓" if has_tr else ""))
+
+    def _selected_audio_ff_index(self):
+        """Seçili ses izinin ffmpeg akış numarası (ffmpeg -map 0:<n>)."""
+        for t in self._last_tracks or []:
+            if t.get("type") == "audio" and t.get("selected"):
+                return t.get("ff-index")
+        return None
+
+    def _find_sub_track_id(self, title):
+        try:
+            for t in self.player.track_list:
+                if t.get("type") == "sub" and t.get("title") == title:
+                    return t.get("id")
+        except Exception:
+            pass
+        return None
+
+    def _add_live_subtitle(self, path, title, lang):
+        """Altyazıyı mpv'ye ekleyip seçer; sonra altyazı listesini tazeler."""
+        try:
+            self.player.command("sub-add", path, "select", title, lang)
+        except Exception as e:
+            print("Altyazı eklenemedi:", e)
+            return
+        QTimer.singleShot(400, self.populate_tracks)
+
+    def _cancel_live_workers(self, wait_ms=0):
+        for w in (self._asr_worker, self._tr_worker):
+            if w is not None:
+                w.cancel()
+                self._retire_worker(w)
+        self._asr_worker = self._tr_worker = None
+        self._live_sub_loaded = False
+        if wait_ms:
+            for w in list(self._live_zombies):
+                if not w.wait(wait_ms):
+                    w.terminate()
+                    w.wait(500)
+
+    def open_model_settings(self):
+        if LIVE is None:
+            QMessageBox.warning(self, "Eksik dosya",
+                                "live_subtitle.py bulunamadı (oynatıcıyla aynı klasörde olmalı).")
+            return
+        dlg = ModelSettingsDialog(self)
+        dlg.exec_()
+        self.setFocus()
+
+    # ---- 🎙 sesten altyazı ----
+    def on_asr_clicked(self):
+        if LIVE is None:
+            QMessageBox.warning(self, "Eksik dosya",
+                                "live_subtitle.py bulunamadı (oynatıcıyla aynı klasörde olmalı).")
+            self.asr_btn.setChecked(False)
+            return
+        if self._asr_worker is not None:                  # çalışıyor -> İPTAL
+            self._asr_worker.cancel()
+            self.asr_btn.setText("🎙 iptal…")
+            self.status_label.setText("🎙 İptal ediliyor…")
+            return
+        if not self.current_path:
+            self.status_label.setText("Önce bir dosya açın.")
+            self.asr_btn.setChecked(False)
+            return
+
+        existing = LIVE.find_sources(self.current_path)   # zaten var -> tekrar üretme
+        if existing:
+            lang, path = existing[0]
+            self._add_live_subtitle(path, f"Whisper ({lang})", lang)
+            self.status_label.setText(
+                f"✓ Altyazı zaten var, yeniden üretilmedi: {os.path.basename(path)}")
+            self.asr_btn.setChecked(False)
+            return
+
+        fw_err = LIVE.fw_import_error()
+        if fw_err and not LIVE.find_xxl_exe():    # ne Python içi ne Subtitle Edit motoru var
+            QMessageBox.warning(self, "Ses tanıma bileşeni yüklenemedi",
+                                LIVE.fw_missing_message(fw_err) + LIVE.XXL_HINT)
+            self.asr_btn.setChecked(False)
+            return
+
+        mid = LIVE.selected_whisper_id()
+        model_path = LIVE.resolve_whisper(mid)
+        if model_path is None:                            # seçili model indirilmemiş
+            ans = QMessageBox.question(
+                self, "Whisper modeli yok",
+                f"Seçili Whisper modeli ({LIVE.whisper_label(mid)}) indirilmemiş.\n\n"
+                "Model Ayarları (📦) penceresi açılsın mı?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            self.asr_btn.setChecked(False)
+            if ans == QMessageBox.Yes:
+                self.open_model_settings()
+            return
+
+        w = LIVE.TranscribeWorker(self.current_path, self._selected_audio_ff_index(),
+                                  model_path=model_path, model_label=LIVE.whisper_label(mid),
+                                  ffmpeg=FFMPEG, no_window=NO_WINDOW)
+        w.progress.connect(self._asr_progress)
+        w.finished_ok.connect(self._asr_done)
+        w.failed.connect(self._asr_failed)
+        w.cancelled.connect(self._asr_cancelled)
+        self._asr_worker = w
+        self.asr_btn.setChecked(True)
+        self.asr_btn.setText("🎙 … ✕")
+        self.status_label.setText("🎙 Altyazı üretimi başlıyor…")
+        w.start()
+
+    def _asr_progress(self, pct, text):
+        self.asr_btn.setText(f"🎙 %{pct} ✕" if pct >= 0 else "🎙 … ✕")
+        self.status_label.setText("🎙 " + text + (f"  %{pct}" if pct >= 0 else ""))
+
+    def _asr_cleanup(self):
+        self._retire_worker(self._asr_worker)
+        self._asr_worker = None
+        self._refresh_live_buttons()
+
+    def _asr_done(self, path, lang):
+        self._asr_cleanup()
+        self._add_live_subtitle(path, f"Whisper ({lang})", lang)
+        extra = "  (konuşma zaten Türkçe, çeviriye gerek yok)" if lang == "tr" else ""
+        self.status_label.setText(f"✓ Altyazı hazır [{lang}]: {os.path.basename(path)}{extra}")
+
+    def _asr_failed(self, msg):
+        self._asr_cleanup()
+        self.status_label.setText("Altyazı üretilemedi.")
+        QMessageBox.warning(self, "Altyazı üretilemedi", msg)
+
+    def _asr_cancelled(self):
+        self._asr_cleanup()
+        self.status_label.setText("Altyazı üretimi iptal edildi.")
+
+    # ---- 🌐 Translate (hedef dil seçilir, tüm altyazı çevrilir) ----
+    def on_translate_clicked(self):
+        if LIVE is None:
+            QMessageBox.warning(self, "Eksik dosya",
+                                "live_subtitle.py bulunamadı (oynatıcıyla aynı klasörde olmalı).")
+            self.tr_btn.setChecked(False)
+            return
+        if self._tr_worker is not None:                   # çeviri sürüyor -> İPTAL
+            self._tr_worker.cancel()
+            self.tr_btn.setText("🌐 iptal…")
+            self.status_label.setText("🌐 İptal ediliyor…")
+            return
+        if not self.current_path:
+            self.status_label.setText("Önce bir dosya açın.")
+            self.tr_btn.setChecked(False)
+            return
+
+        all_src = LIVE.find_sources(self.current_path)
+        if not all_src:
+            msg = ("Önce 🎙 düğmesiyle sesten altyazı oluşturulmalı."
+                   if self._asr_worker is None else
+                   "Altyazı üretimi henüz bitmedi. Bitince 🌐 düğmesine tekrar basın.")
+            QMessageBox.information(self, "Kaynak altyazı yok", msg)
+            self.tr_btn.setChecked(False)
+            return
+
+        # Kaynak dil kendiliğinden bilinir: en eski film.ai.<dil>.srt (Whisper çıktısı)
+        src_lang, _src_path = LIVE.pick_source(self.current_path, "") or all_src[0]
+        cfg = LIVE.load_config()
+        dlg = TargetLangDialog(self, src_lang, cfg.get("last_target"))
+        if dlg.exec_() != QDialog.Accepted or not dlg.chosen:
+            self.tr_btn.setChecked(False)
+            return
+        dst = dlg.chosen
+        cfg["last_target"] = dst
+        try:
+            LIVE.save_config(cfg)
+        except Exception:
+            pass
+
+        final = LIVE.final_path(self.current_path, dst)
+        if os.path.exists(final):                         # bu dile zaten çevrilmiş
+            self._add_live_subtitle(final, f"{LIVE.lang_label(dst)} (AI)", dst)
+            self.status_label.setText(
+                f"✓ {LIVE.lang_label(dst)} altyazı zaten var, yeniden çevrilmedi: {os.path.basename(final)}")
+            self.tr_btn.setChecked(False)
+            return
+        source = LIVE.pick_source(self.current_path, dst)
+        if source is None:
+            self.tr_btn.setChecked(False)
+            return
+
+        model = LIVE.selected_translate_model()
+        status = LIVE.ollama_status(model=model)
+        if status == "down":
+            QMessageBox.warning(self, "Ollama kapalı",
+                                "Çeviri için Ollama çalışıyor olmalı.\n\n"
+                                "Lütfen Ollama'yı açın, sonra 🌐 düğmesine tekrar basın.")
+            self.tr_btn.setChecked(False)
+            return
+        if status == "no_model":                          # sadece uyarı: indirmeyi kullanıcı yapar
+            QMessageBox.warning(self, "Çeviri modeli yüklü değil",
+                                f"'{model}' Ollama'da yüklü değil.\n\n"
+                                f"Komut satırında şunu çalıştırın:\n\n    ollama pull {model}\n\n"
+                                "Bitince 🌐 düğmesine tekrar basın.\n"
+                                "(Yüklü olan başka bir boyutu 📦 penceresinden seçebilirsiniz.)")
+            self.tr_btn.setChecked(False)
+            return
+        self._start_translate(source, model, dst)
+
+    def _start_translate(self, source, model, dst):
+        lang, path = source
+        out = LIVE.final_path(self.current_path, dst)
+        w = LIVE.TranslateWorker(path, lang, out, None, model=model, dst_lang=dst, live=False)
+        self._tr_model_label = model.split(":")[-1].upper()
+        self._tr_dst = dst
+        w.progress.connect(self._tr_progress)
+        w.finished_ok.connect(self._tr_done)
+        w.failed.connect(self._tr_failed)
+        w.cancelled.connect(self._tr_cancelled)
+        self._tr_worker = w
+        self.tr_btn.setChecked(True)
+        self.tr_btn.setText("🌐 … ✕")
+        self.status_label.setText(
+            f"🌐 Çeviri başlıyor: {LIVE.lang_label(lang)} → {LIVE.lang_label(dst)} "
+            f"(TranslateGemma {self._tr_model_label})…")
+        w.start()
+
+    def _tr_progress(self, done, total):
+        pct = int(100 * done / total) if total else 0
+        self.tr_btn.setText(f"🌐 %{pct} ✕")
+        self.status_label.setText(
+            f"🌐 {LIVE.lang_label(getattr(self, '_tr_dst', ''))} çeviri [{self._tr_model_label}]: {done}/{total} satır  (%{pct})")
+
+    def _tr_live(self, path):
+        """Yeni çevrilmiş satırlar geldi: altyazı izini ekle (ilk seferde) ya da yenile."""
+        tid = self._find_sub_track_id(self.LIVE_SUB_TITLE)
+        if tid is None:
+            if not self._live_sub_loaded:
+                self._live_sub_loaded = True
+                self._add_live_subtitle(path, self.LIVE_SUB_TITLE, "tr")
+            return                      # iz listede görünene kadar bir sonraki güncellemeyi bekle
+        try:
+            self.player.command("sub-reload", tid)
+        except Exception as e:
+            print("Altyazı yenilenemedi:", e)
+
+    def _tr_cleanup(self):
+        self._retire_worker(self._tr_worker)
+        self._tr_worker = None
+        self._refresh_live_buttons()
+
+    def _tr_done(self, final):
+        self._tr_cleanup()
+        dst = getattr(self, "_tr_dst", LIVE.TARGET_LANG)
+        self._add_live_subtitle(final, f"{LIVE.lang_label(dst)} (AI)", dst)
+        self.status_label.setText(f"✓ Çeviri bitti, altyazı yüklendi: {os.path.basename(final)}")
+
+    def _tr_failed(self, msg):
+        self._tr_cleanup()
+        self.status_label.setText("Çeviri durdu.")
+        if "Ollama" in msg:
+            QMessageBox.warning(self, "Ollama kapalı",
+                                msg + "\n\nOllama'yı açıp 🌐 düğmesine tekrar basın.")
+        else:
+            QMessageBox.warning(self, "Çeviri hatası", msg)
+
+    def _tr_cancelled(self):
+        self._tr_cleanup()
+        self.status_label.setText("Çeviri iptal edildi.")
 
     def seek_relative(self, seconds):
         try:
@@ -2647,6 +3347,7 @@ class VideoStudioPlayer(QMainWindow):
             self.film_end.update()
 
     def closeEvent(self, event):
+        self._cancel_live_workers(wait_ms=3000)
         self._cancel_thumb_workers()
         for w in list(self._thumb_workers):
             w.wait(1500)
