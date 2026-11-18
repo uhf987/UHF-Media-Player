@@ -157,7 +157,8 @@ def _app_dir(kind):
 
 
 DEFAULT_CONFIG = {"whisper_model": None, "translate_model": TRANSLATE_MODEL, "custom_whisper_dirs": [],
-                  "xxl_exe": None, "favorite_langs": ["tr", "en"], "last_target": None}
+                  "xxl_exe": None, "favorite_langs": ["tr", "en"], "last_target": None,
+                  "sync_fill_missing": True}   # 🔄 Senkronla: altyazıda olmayan ek sahneleri referanstan ekle
 
 
 def config_path():

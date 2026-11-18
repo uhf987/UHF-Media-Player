@@ -159,6 +159,14 @@ try:
 except Exception as _live_err:  # pragma: no cover
     LIVE = None
     print("live_subtitle yüklenemedi:", _live_err)
+# 🔄 Altyazı senkronlama (kullanıcının altyazısını Whisper referansına göre hizalar)
+try:
+    import subtitle_sync as SYNC  # noqa: E402
+    if not hasattr(SYNC, "SyncWorker"):      # Qt yoksa işçi tanımlanmaz
+        raise ImportError("SyncWorker yok")
+except Exception as _sync_err:  # pragma: no cover
+    SYNC = None
+    print("subtitle_sync yüklenemedi:", _sync_err)
 
 # Windows dosya ilişkilendirmesiyle (bir video dosyasına çift tıklama) her
 # seferinde YENİ bir işlem başlar. Tek pencere kalması için bu isimde bir
@@ -1786,6 +1794,9 @@ class VideoStudioPlayer(QMainWindow):
         self._music_id_worker = None
         self._asr_worker = None      # 🎙 sesten altyazı işçisi
         self._tr_worker = None       # 🌐 canlı çeviri işçisi
+        self._sync_worker = None     # 🔄 altyazı senkron işçisi
+        self._dropped_srt = None     # son sürüklenip bırakılan (kullanıcının) altyazı dosyası
+        self._sync_after_asr = False # referans yoksa: Whisper bitince senkronu başlat
         self._live_zombies = []      # bitmesi beklenen eski işçiler (GC'den korumak için)
         self._live_sub_loaded = False
         self._tr_model_label = ""
@@ -2144,6 +2155,19 @@ class VideoStudioPlayer(QMainWindow):
             "Çalışırken tekrar basarsanız İPTAL eder."
         )
         tracks_layout.addWidget(self.tr_btn)
+        self.sync_btn = QPushButton(self.LIVE_IDLE_SYNC)
+        self.sync_btn.setCheckable(True)
+        self.sync_btn.setFixedWidth(104)
+        self.sync_btn.setStyleSheet(_live_btn_style)
+        self.sync_btn.setToolTip(
+            "Sürüklediğiniz altyazıyı filme göre senkronla\n"
+            "Filmin sesinden çıkarılan altyazı (Whisper) referans alınır; sizin altyazınızın\n"
+            "metni korunur, yalnızca zamanları filme uydurulur (kayma, kare hızı farkı,\n"
+            "kesinti/ek sahne). Referans yoksa önce filmin sesinden üretilir.\n"
+            "Sonuç <altyazı>.synced.srt olarak kaydedilir; orijinal dosyaya dokunulmaz.\n"
+            "Çalışırken tekrar basarsanız İPTAL eder."
+        )
+        tracks_layout.addWidget(self.sync_btn)
         self.model_btn = QPushButton("📦")
         self.model_btn.setFixedWidth(40)
         self.model_btn.setStyleSheet(_live_btn_style)
@@ -2251,6 +2275,7 @@ class VideoStudioPlayer(QMainWindow):
         self.subtitle_settings_btn.clicked.connect(self.open_subtitle_settings)
         self.asr_btn.clicked.connect(self.on_asr_clicked)
         self.tr_btn.clicked.connect(self.on_translate_clicked)
+        self.sync_btn.clicked.connect(self.on_sync_clicked)
         self.model_btn.clicked.connect(self.open_model_settings)
 
         self.chk_rotate.stateChanged.connect(self._on_rotate_settings_changed)
@@ -2282,7 +2307,7 @@ class VideoStudioPlayer(QMainWindow):
         içeriği kesmesin: genişlik en az eskisi kadar, gerekirse içeriğe göre büyür."""
         for b in (self.btn_open, self.play_btn, self.screenshot_btn, self.music_id_btn,
                   self.btn_mono_l, self.btn_mono_r, self.subtitle_settings_btn,
-                  self.asr_btn, self.tr_btn, self.model_btn, self.btn_export):
+                  self.asr_btn, self.tr_btn, self.sync_btn, self.model_btn, self.btn_export):
             base = b.minimumWidth()
             b.setMaximumWidth(16777215)
             b.setMinimumWidth(max(base, b.sizeHint().width()))
@@ -2296,7 +2321,7 @@ class VideoStudioPlayer(QMainWindow):
             self.play_btn, self.screenshot_btn, self.music_id_btn, self.chk_auto_rename,
             self.btn_mono_l, self.btn_mono_r, self.volume_slider,
             self.seek_slider, self.audio_combo, self.subtitle_combo,
-            self.subtitle_settings_btn, self.asr_btn, self.tr_btn, self.model_btn,
+            self.subtitle_settings_btn, self.asr_btn, self.tr_btn, self.sync_btn, self.model_btn,
             self.chk_rotate, self.radio_cw,
             self.radio_ccw, self.radio_180, self.chk_crop, self.chk_trim,
             self.trim_bar, self.btn_trim_start_minus, self.btn_trim_start_plus,
@@ -2332,6 +2357,8 @@ class VideoStudioPlayer(QMainWindow):
             self._pending_open_path = path
             return
         self._cancel_live_workers()   # önceki filmin altyazı/çeviri işleri bitsin
+        self._dropped_srt = None
+        self._sync_after_asr = False
         self.current_path = path
         self.idle_logo.hide()
         self.native_w = self.native_h = None
@@ -2413,6 +2440,10 @@ class VideoStudioPlayer(QMainWindow):
             self.player.sub_add(path, flags="select")
         except Exception as e:
             print("Altyazı eklenemedi:", e)
+        self._dropped_srt = path          # 🔄 Senkronla bu dosyayı kullanır
+        if SYNC is not None:
+            self.status_label.setText(
+                "Altyazı yüklendi. Filmle uyumsuzsa 🔄 Senkronla düğmesine basın.")
         QTimer.singleShot(500, self.populate_tracks)
 
     # ------------------------------------------------------------ oynatma
@@ -2501,6 +2532,7 @@ class VideoStudioPlayer(QMainWindow):
     LIVE_IDLE_ASR = "🎙 Altyazı"
     LIVE_IDLE_TR = "🌐 Translate"
     LIVE_SUB_TITLE = "Canlı Türkçe"
+    LIVE_IDLE_SYNC = "🔄 Senkronla"
 
     def _retire_worker(self, worker):
         """Çalışmaya devam eden bir QThread'in nesnesi çöp toplayıcıya gidip
@@ -2529,6 +2561,9 @@ class VideoStudioPlayer(QMainWindow):
         if not tr_on:
             self.tr_btn.setChecked(False)
             self.tr_btn.setText(self.LIVE_IDLE_TR + (" ✓" if has_tr else ""))
+        if self._sync_worker is None and not self._sync_after_asr:
+            self.sync_btn.setChecked(False)
+            self.sync_btn.setText(self.LIVE_IDLE_SYNC)
 
     def _selected_audio_ff_index(self):
         """Seçili ses izinin ffmpeg akış numarası (ffmpeg -map 0:<n>)."""
@@ -2556,11 +2591,11 @@ class VideoStudioPlayer(QMainWindow):
         QTimer.singleShot(400, self.populate_tracks)
 
     def _cancel_live_workers(self, wait_ms=0):
-        for w in (self._asr_worker, self._tr_worker):
+        for w in (self._asr_worker, self._tr_worker, self._sync_worker):
             if w is not None:
                 w.cancel()
                 self._retire_worker(w)
-        self._asr_worker = self._tr_worker = None
+        self._asr_worker = self._tr_worker = self._sync_worker = None
         self._live_sub_loaded = False
         if wait_ms:
             for w in list(self._live_zombies):
@@ -2671,6 +2706,8 @@ class VideoStudioPlayer(QMainWindow):
 
     def _asr_progress(self, pct, text):
         self.asr_btn.setText(f"🎙 %{pct} ✕" if pct >= 0 else "🎙 … ✕")
+        if self._sync_after_asr:
+            self.sync_btn.setText("🔄 referans…")
         self.status_label.setText("🎙 " + text + (f"  %{pct}" if pct >= 0 else ""))
 
     def _asr_cleanup(self):
@@ -2680,18 +2717,153 @@ class VideoStudioPlayer(QMainWindow):
 
     def _asr_done(self, path, lang):
         self._asr_cleanup()
-        self._add_live_subtitle(path, f"Whisper ({lang})", lang)
+        chained = self._sync_after_asr
+        if not chained:      # senkron zincirinde Whisper altyazısını seçme: kullanıcınınki kalsın
+            self._add_live_subtitle(path, f"Whisper ({lang})", lang)
         extra = "  (konuşma zaten Türkçe, çeviriye gerek yok)" if lang == "tr" else ""
         self.status_label.setText(f"✓ Altyazı hazır [{lang}]: {os.path.basename(path)}{extra}")
+        if chained:
+            self._sync_after_asr = False
+            self._start_sync(path)
 
     def _asr_failed(self, msg):
         self._asr_cleanup()
+        self._sync_after_asr = False
+        self._refresh_live_buttons()
         self.status_label.setText("Altyazı üretilemedi.")
         QMessageBox.warning(self, "Altyazı üretilemedi", msg)
 
     def _asr_cancelled(self):
         self._asr_cleanup()
+        self._sync_after_asr = False
+        self._refresh_live_buttons()
         self.status_label.setText("Altyazı üretimi iptal edildi.")
+
+    # ---- 🔄 Senkronla (kullanıcının altyazısı -> Whisper referansına göre hizalanır) ----
+    def _sync_reference(self):
+        """Videonun yanındaki en eski film.ai.<dil>.srt (Whisper çıktısı) -> yol | None"""
+        if LIVE is None or not self.current_path:
+            return None
+        src = LIVE.pick_source(self.current_path, "")
+        return src[1] if src else None
+
+    def on_sync_clicked(self):
+        if SYNC is None:
+            QMessageBox.warning(self, "Eksik dosya",
+                                "subtitle_sync.py bulunamadı (oynatıcıyla aynı klasörde olmalı) "
+                                "ya da numpy yüklü değil (pip install numpy).")
+            self.sync_btn.setChecked(False)
+            return
+        if self._sync_worker is not None:                 # çalışıyor -> İPTAL
+            self._sync_worker.cancel()
+            self.sync_btn.setText("🔄 iptal…")
+            self.status_label.setText("🔄 İptal ediliyor…")
+            return
+        if self._sync_after_asr:                          # referans üretiliyor -> İPTAL
+            self._sync_after_asr = False
+            if self._asr_worker is not None:
+                self._asr_worker.cancel()
+            self.sync_btn.setChecked(False)
+            return
+        if not self.current_path or LIVE is None:
+            self.status_label.setText("Önce bir film açın.")
+            self.sync_btn.setChecked(False)
+            return
+
+        user_srt = self._dropped_srt
+        if not user_srt or not os.path.isfile(user_srt):  # sürüklenmemişse dosya seçtir
+            user_srt, _ = QFileDialog.getOpenFileName(
+                self, "Senkronlanacak altyazıyı seçin (ya da pencereye sürükleyip bırakın)",
+                os.path.dirname(self.current_path), "Altyazı (*.srt)")
+            if not user_srt:
+                self.sync_btn.setChecked(False)
+                return
+            self._dropped_srt = user_srt
+
+        ref = self._sync_reference()
+        if ref is None:                                   # referans yok -> önce Whisper ile üret
+            ans = QMessageBox.question(
+                self, "Referans altyazı yok",
+                "Senkron için filmin sesinden bir referans altyazı gerekir. Önce 🎙 ile "
+                "üretilecek (film uzunluğuna ve donanıma göre dakikalar sürebilir), bitince "
+                "senkron otomatik başlayacak.\n\nDevam edilsin mi?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ans != QMessageBox.Yes:
+                self.sync_btn.setChecked(False)
+                return
+            self._sync_after_asr = True
+            self.sync_btn.setChecked(True)
+            self.sync_btn.setText("🔄 referans…")
+            self.on_asr_clicked()                         # dil seçtirir, üretir; _asr_done sürdürür
+            if self._asr_worker is None and self._sync_after_asr:
+                # üretim başlamadı: dil seçimi iptal / model yok / referans aradan belirdi
+                self._sync_after_asr = False
+                ref = self._sync_reference()
+                if ref is None:
+                    self.sync_btn.setChecked(False)
+                    self._refresh_live_buttons()
+                    return
+                self._start_sync(ref)
+            return
+        self._start_sync(ref)
+
+    def _start_sync(self, ref_srt):
+        user_srt = self._dropped_srt
+        if not user_srt or not os.path.isfile(user_srt):
+            self.sync_btn.setChecked(False)
+            self._refresh_live_buttons()
+            return
+        if os.path.abspath(user_srt) == os.path.abspath(ref_srt):
+            self.status_label.setText("Bu dosya zaten referans altyazı; kendisiyle senkronlanamaz.")
+            self.sync_btn.setChecked(False)
+            self._refresh_live_buttons()
+            return
+        stem = user_srt[:-4] if user_srt.lower().endswith(".srt") else user_srt
+        if stem.endswith(".synced"):
+            stem = stem[:-len(".synced")]
+        out = stem + ".synced.srt"
+        fill = True
+        try:
+            fill = bool(LIVE.load_config().get("sync_fill_missing", True))
+        except Exception:
+            pass
+        w = SYNC.SyncWorker(user_srt, ref_srt, out, fill_missing=fill)
+        w.progress.connect(self._sync_progress)
+        w.finished_ok.connect(self._sync_done)
+        w.failed.connect(self._sync_failed)
+        w.cancelled.connect(self._sync_cancelled)
+        self._sync_worker = w
+        self.sync_btn.setChecked(True)
+        self.sync_btn.setText("🔄 … ✕")
+        self.status_label.setText("🔄 Senkron başlıyor…")
+        w.start()
+
+    def _sync_progress(self, pct, text):
+        self.sync_btn.setText(f"🔄 %{pct} ✕" if pct >= 0 else "🔄 … ✕")
+        self.status_label.setText("🔄 " + text)
+
+    def _sync_cleanup(self):
+        self._retire_worker(self._sync_worker)
+        self._sync_worker = None
+        self._refresh_live_buttons()
+
+    def _sync_done(self, path, rep):
+        self._sync_cleanup()
+        try:
+            self.player.command("sub-add", path, "select", "Senkronlanmış")
+        except Exception as e:
+            print("Altyazı eklenemedi:", e)
+        QTimer.singleShot(400, self.populate_tracks)
+        self.status_label.setText("✓ " + SYNC.describe(rep) + f"  → {os.path.basename(path)}")
+
+    def _sync_failed(self, msg):
+        self._sync_cleanup()
+        self.status_label.setText("Senkron başarısız.")
+        QMessageBox.warning(self, "Senkronlanamadı", msg)
+
+    def _sync_cancelled(self):
+        self._sync_cleanup()
+        self.status_label.setText("Senkron iptal edildi.")
 
     # ---- 🌐 Translate (hedef dil seçilir, tüm altyazı çevrilir) ----
     def on_translate_clicked(self):
